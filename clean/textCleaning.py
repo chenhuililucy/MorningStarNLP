@@ -6,17 +6,25 @@ import nltk
 from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
 import tiktoken
+import logging
+import concurrent.futures
+import threading
+
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class textCleaning:
     def __init__(self, num_merges=1000, top_n=5, similarity_threshold=0.95):
         self.num_merges = num_merges
         self.top_n = top_n
         self.similarity_threshold = similarity_threshold
-        # Load OpenAI's tokenizer (using GPT-4 encoding)
         self.tokenizer = tiktoken.get_encoding("cl100k_base")
-        # Ensure necessary NLTK resources are downloaded
+        #  Load OpenAI's tokenizer (using GPT-4 encoding)
         nltk.download("punkt")
         nltk.download("stopwords")
+        self.lock = threading.Lock()  # Ensure thread-safe logging
+        self.processed_count = 0  # Track processed documents
+
 
     @staticmethod
     def tokenize(text):
@@ -41,7 +49,7 @@ class textCleaning:
         """
         documents = [self.tokenize(text) for text in documents]
 
-        for _ in range(self.num_merges):
+        for numMerge in range(self.num_merges):
             pair_counts = Counter()
             for tokens in documents:
                 pair_counts.update(self.get_word_pairs(tokens))
@@ -70,6 +78,9 @@ class textCleaning:
 
             documents = updated_documents
 
+            if  numMerge % 50 == 0:
+                logging.info(f"Total merges performed: {numMerge}")
+    
         # Extract only the top `top_n` longest merged phrases
         merged_phrases = set()
         for tokens in documents:
@@ -88,14 +99,14 @@ class textCleaning:
         words = re.findall(r'\b[a-zA-Z]+\b', text)
         return words[0] if words else ""
 
-    def remove_similar_sections(self, documents, reference_phrases):
-        """
-        Removes text sections similar to the reference phrases.
 
-        Returns:
-        - List[str]: Cleaned documents.
-        """
+    def process_documents_with_logging(self, documents, reference_phrases, num_threads=4):
+        """Parallelized method for processing documents, logging progress rate and token ratio."""
+        
+        total_docs = len(documents)  # Total number of documents
         cleaned_documents = []
+        removal_lengths = []
+        token_ratios = []
 
         # Build dictionary where key = first word, value = list of full phrases
         phrase_dict = defaultdict(list)
@@ -103,9 +114,10 @@ class textCleaning:
             first_word = self.get_first_word(phrase.replace("_", " "))
             phrase_dict[first_word].append(phrase.replace("_", " "))
 
-        for document in documents:
+        def process_single_document(document):
             tokens = self.tokenize(document)
             to_remove = set()
+            removed_texts = []
 
             for i in range(len(tokens)):
                 window_text = " ".join(tokens[i:])
@@ -128,14 +140,41 @@ class textCleaning:
                     # Compute similarity
                     if self.similarity_score(window_text, phrase) >= self.similarity_threshold:
                         to_remove.update(range(i, i + phrase_length))
+                        removed_texts.append(window_text)  # Store removed text
                         break  
+
+            # Compute removed text length
+            total_removed_length = sum(len(text) for text in removed_texts)
 
             # Remove identified sections
             cleaned_tokens = [tokens[i] for i in range(len(tokens)) if i not in to_remove]
-            cleaned_documents.append(" ".join(cleaned_tokens))
+            cleaned_document = " ".join(cleaned_tokens)
+
+            # Compute token ratio: cleaned tokens / original tokens
+            original_token_count = len(tokens)
+            cleaned_token_count = len(cleaned_tokens)
+            token_ratio = cleaned_token_count / original_token_count if original_token_count > 0 else 0
+
+            # Thread-safe logging & progress update
+            with self.lock:
+                self.processed_count += 1
+                progress = (self.processed_count / total_docs) * 100
+                logging.info(f"Progress: {self.processed_count}/{total_docs} ({progress:.2f}%) - Removed text length: {total_removed_length} - Token Ratio: {token_ratio:.4f}")
+
+            return cleaned_document, total_removed_length, token_ratio
+
+        # Use ThreadPoolExecutor for parallel processing
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+            results = list(executor.map(process_single_document, documents))
+
+        # Unpack results
+        for cleaned_doc, removed_len, token_ratio in results:
+            cleaned_documents.append(cleaned_doc)
+            removal_lengths.append(removed_len)
+            token_ratios.append(token_ratio)
 
         return cleaned_documents
-
+        
     def process_documents(self, documents):
         """
         Full pipeline:
@@ -146,10 +185,10 @@ class textCleaning:
         - List[str]: Cleaned documents.
         """
         print("\n🔍 Extracting most frequent merged phrases...")
-        top_disclaimer_phrases = self.merge_most_frequent(documents)
+        top_disclaimer_phrases = self.merge_most_frequent(documents[1:100])
         print(f"✅ Extracted {len(top_disclaimer_phrases)} phrases with at least {self.top_n} words.")
         print("\n🧹 Removing detected disclaimer sections...")
-        cleaned_documents = self.remove_similar_sections(documents, top_disclaimer_phrases)
+        cleaned_documents = self.process_documents_with_logging(documents, top_disclaimer_phrases)
         print("✅ Disclaimer sections removed.")
 
         return cleaned_documents
@@ -169,5 +208,5 @@ class textCleaning:
 
 # Example usage
 # Assuming df["content_cleaned"] contains the documents
-# processor = textCleaning(num_merges=1000, top_n=5, similarity_threshold=0.95)
+# processor = RemoveDisclaimer(num_merges=1000, top_n=5, similarity_threshold=0.95)
 # cleaned_documents = processor.process_documents(df["content_cleaned"])
